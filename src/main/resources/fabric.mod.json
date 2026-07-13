@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "fullset",
+  "version": "${version}",
+  "name": "Fullset",
+  "description": "Client-side: save and restore named inventory loadouts with /setfullset and /fullset.",
+  "authors": ["You"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.example.fullset.FullsetMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "~26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
