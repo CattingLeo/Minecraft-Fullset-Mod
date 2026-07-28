@@ -46,7 +46,7 @@ This mod is **client-side only** — the server does not need it installed.
 ./gradlew clean build
 ```
 
-The mod appears at `build/libs/fullset-1.1.0.jar`.
+The mod appears at `build/libs/fullset-1.2.0.jar`.
 
 This branch targets **Minecraft 26.2** and needs **JDK 25** (Gradle 9.5.1, Loom 1.17,
 Fabric API 0.153.0+26.2). The mod has also been built for 26.1.2 and 1.21.11.
@@ -55,5 +55,5 @@ Fabric API 0.153.0+26.2). The mod has also been built for 26.1.2 and 1.21.11.
 
 1. Install the [Fabric loader](https://fabricmc.net/use/installer/) for Minecraft 26.2.
 2. Put [Fabric API](https://modrinth.com/mod/fabric-api) (the 26.2 version) in your `mods` folder.
-3. Put `fullset-1.1.0.jar` in your `mods` folder.
+3. Put `fullset-1.2.0.jar` in your `mods` folder.
 4. Launch the game and try `/setfullset mykit`!
