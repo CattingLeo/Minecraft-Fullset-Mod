@@ -1,12 +1,13 @@
 package com.example.fullset;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
-import com.mojang.serialization.Codec;
 import com.mojang.serialization.JsonOps;
 import io.netty.buffer.Unpooled;
 import net.minecraft.core.RegistryAccess;
@@ -56,15 +57,13 @@ public class FullsetMod implements ClientModInitializer {
             EquipmentSlot.FEET, EquipmentSlot.LEGS, EquipmentSlot.CHEST, EquipmentSlot.HEAD
     };
 
-    private static final Codec<Map<String, List<ItemStack>>> STORE_CODEC =
-            Codec.unboundedMap(Codec.STRING, ItemStack.OPTIONAL_CODEC.listOf());
-
     // name -> 41 stacks. Stored globally in .minecraft/config (shared across worlds/servers).
     private static final Map<String, List<ItemStack>> STORE = new HashMap<>();
     private static boolean loaded = false;
 
-    // A restore waiting for the server to put us into creative mode.
+    // A restore in progress: waiting for creative mode, then applying slots a few per tick.
     private static PendingRestore pending = null;
+    private static final int APPLY_PER_TICK = 6;
     // How many enchantments the last restore had to drop (server didn't have them).
     private static int lastDropped = 0;
 
@@ -93,32 +92,76 @@ public class FullsetMod implements ClientModInitializer {
     // ---- persistence (global, crash-proof) ----
 
     private static synchronized void ensureLoaded(ClientPacketListener conn) {
-        if (loaded) return;
+        if (loaded || conn == null) return; // retry later if we didn't have a connection yet
         loaded = true;
         Path file = storeFile();
-        if (!Files.exists(file) || conn == null) return;
+        if (!Files.exists(file)) return;
         try {
             RegistryOps<JsonElement> ops = RegistryOps.create(JsonOps.INSTANCE, conn.registryAccess());
-            JsonElement json = JsonParser.parseString(Files.readString(file));
-            Map<String, List<ItemStack>> raw = STORE_CODEC.parse(ops, json).getOrThrow();
+            JsonObject root = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+            Map<String, List<ItemStack>> raw = new HashMap<>();
+            int dropped = 0;
+            for (String name : root.keySet()) {
+                JsonArray arr = root.getAsJsonArray(name);
+                List<ItemStack> stacks = new ArrayList<>(arr.size());
+                // Decode one item at a time: an item this world/server can't resolve
+                // (different datapack, disabled enchantment, etc.) is dropped instead
+                // of corrupting the whole loadout.
+                for (JsonElement itemJson : arr) {
+                    ItemStack stack = ItemStack.EMPTY;
+                    try {
+                        stack = ItemStack.OPTIONAL_CODEC.parse(ops, itemJson).getOrThrow();
+                    } catch (Exception ex) {
+                        dropped++;
+                    }
+                    stacks.add(stack);
+                }
+                raw.put(name, stacks);
+            }
             STORE.clear();
             STORE.putAll(raw);
+            if (dropped > 0) {
+                System.err.println("[fullset] " + dropped + " item(s) couldn't load (incompatible with this world/server) and were dropped.");
+            }
         } catch (Exception ex) {
             System.err.println("[fullset] Failed to load loadouts: " + ex.getMessage());
         }
     }
 
-    private static synchronized void saveStore(ClientPacketListener conn) {
+    private static synchronized boolean saveStore(ClientPacketListener conn) {
         try {
             RegistryOps<JsonElement> ops = RegistryOps.create(JsonOps.INSTANCE, conn.registryAccess());
-            JsonElement json = STORE_CODEC.encodeStart(ops, STORE).getOrThrow();
+            JsonObject root = new JsonObject();
+            for (Map.Entry<String, List<ItemStack>> entry : STORE.entrySet()) {
+                JsonArray arr = new JsonArray();
+                // Encode one item at a time: a loadout carrying an item from a different
+                // server's registries can't sink every other loadout's save.
+                for (ItemStack stack : entry.getValue()) {
+                    arr.add(encodeItemSafe(stack, ops));
+                }
+                root.add(entry.getKey(), arr);
+            }
             Path file = storeFile();
             Files.createDirectories(file.getParent());
             Path tmp = file.resolveSibling("loadouts.json.tmp");
-            Files.writeString(tmp, json.toString());
+            Files.writeString(tmp, root.toString());
             Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            return true;
         } catch (Exception ex) {
             System.err.println("[fullset] Failed to save loadouts: " + ex.getMessage());
+            return false;
+        }
+    }
+
+    private static JsonElement encodeItemSafe(ItemStack stack, RegistryOps<JsonElement> ops) {
+        try {
+            return ItemStack.OPTIONAL_CODEC.encodeStart(ops, stack).getOrThrow();
+        } catch (Exception ex) {
+            try {
+                return ItemStack.OPTIONAL_CODEC.encodeStart(ops, ItemStack.EMPTY).getOrThrow();
+            } catch (Exception inner) {
+                return new JsonObject();
+            }
         }
     }
 
@@ -149,7 +192,8 @@ public class FullsetMod implements ClientModInitializer {
     private static int save(CommandContext<FabricClientCommandSource> ctx, String name) {
         FabricClientCommandSource source = ctx.getSource();
         LocalPlayer player = source.getPlayer();
-        ensureLoaded(source.getClient().getConnection());
+        ClientPacketListener conn = source.getClient().getConnection();
+        ensureLoaded(conn);
 
         Inventory inv = player.getInventory();
         List<ItemStack> stacks = new ArrayList<>(SIZE);
@@ -162,9 +206,12 @@ public class FullsetMod implements ClientModInitializer {
         stacks.add(player.getItemBySlot(EquipmentSlot.OFFHAND).copy()); // 40 offhand
 
         STORE.put(name, stacks);
-        saveStore(source.getClient().getConnection());
-
-        source.sendFeedback(Component.literal("Saved loadout '" + name + "'.").withStyle(GREEN));
+        if (saveStore(conn)) {
+            source.sendFeedback(Component.literal("Saved loadout '" + name + "'.").withStyle(GREEN));
+        } else {
+            source.sendError(Component.literal(
+                    "Saved loadout '" + name + "' in memory, but writing loadouts.json failed - it won't survive a restart. Check the log."));
+        }
         return 1;
     }
 
@@ -233,7 +280,7 @@ public class FullsetMod implements ClientModInitializer {
         pending = new PendingRestore(name, copies, previous);
         conn.sendCommand("gamemode creative");
         client.gui.hud.setOverlayMessage(
-                Component.literal("Fullset v2: restoring '" + name + "'...").withStyle(GREEN), false);
+                Component.literal("Fullset: restoring '" + name + "'...").withStyle(GREEN), false);
         return 1;
     }
 
@@ -246,46 +293,56 @@ public class FullsetMod implements ClientModInitializer {
         }
         pending.ticks++;
 
-        // We can push creative packets once the server has actually made us creative.
-        boolean creative = client.gameMode.getPlayerMode() == GameType.CREATIVE
-                || client.player.getAbilities().instabuild;
-
-        if (!creative) {
-            if (pending.ticks > 100) { // ~5 seconds and still not creative
-                client.gui.hud.setOverlayMessage(
-                        Component.literal("Fullset v2: couldn't restore '" + pending.name + "' - not detected as creative.")
-                                .withStyle(RED), false);
-                pending = null;
+        if (!pending.creativeConfirmed) {
+            // We can push creative packets once the server has actually made us creative.
+            boolean creative = client.gameMode.getPlayerMode() == GameType.CREATIVE
+                    || client.player.getAbilities().instabuild;
+            if (!creative) {
+                if (pending.ticks > 100) { // ~5 seconds and still not creative
+                    client.gui.hud.setOverlayMessage(
+                            Component.literal("Fullset: couldn't restore '" + pending.name
+                                    + "' - not detected as creative. Do you have permission to use /gamemode here?")
+                                    .withStyle(RED), false);
+                    pending = null;
+                }
+                return; // keep waiting
             }
-            return; // keep waiting
+            pending.creativeConfirmed = true;
+            lastDropped = 0;
         }
 
+        // Apply a handful of slots per tick instead of all 41 at once - a single-tick burst
+        // of creative set-slot packets is exactly what server anti-cheat (NoCheatPlus, Grim,
+        // Vulcan, ...) flags as an impossible inventory edit and can cancel or punish.
         try {
-            // We're in creative: push every slot straight into the inventory. Each item is
-            // first made safe for THIS server so a bad reference can't break the connection.
             RegistryAccess ra = client.getConnection().registryAccess();
-            lastDropped = 0;
-            for (int i = 0; i < SIZE; i++) {
+            int end = Math.min(pending.applied + APPLY_PER_TICK, SIZE);
+            for (int i = pending.applied; i < end; i++) {
                 ItemStack stack = (i < pending.stacks.size() && pending.stacks.get(i) != null)
                         ? pending.stacks.get(i).copy() : ItemStack.EMPTY;
                 client.gameMode.handleCreativeModeItemAdd(safeForCreative(stack, ra), menuSlot(i));
             }
-            if (pending.previous != null && pending.previous != GameType.CREATIVE) {
-                client.getConnection().sendCommand("gamemode " + pending.previous.getName());
-            }
-            String note = (lastDropped > 0)
-                    ? " (" + lastDropped + " enchantment(s) this server blocks were skipped)"
-                    : "";
-            client.gui.hud.setOverlayMessage(
-                    Component.literal("Fullset v2: restored '" + pending.name + "'." + note).withStyle(GREEN), false);
+            pending.applied = end;
         } catch (Exception e) {
             client.gui.hud.setOverlayMessage(
-                    Component.literal("Fullset v2: restore of '" + pending.name + "' FAILED: "
+                    Component.literal("Fullset: restore of '" + pending.name + "' FAILED: "
                             + e.getClass().getSimpleName()).withStyle(RED), false);
             System.err.println("[fullset] restore error: " + e);
-        } finally {
-            pending = null; // always finish, so it never gets stuck on "Restoring..."
+            pending = null;
+            return;
         }
+
+        if (pending.applied < SIZE) return; // more slots next tick
+
+        if (pending.previous != null && pending.previous != GameType.CREATIVE) {
+            client.getConnection().sendCommand("gamemode " + pending.previous.getName());
+        }
+        String note = (lastDropped > 0)
+                ? " (" + lastDropped + " enchantment(s) this server blocks were skipped)"
+                : "";
+        client.gui.hud.setOverlayMessage(
+                Component.literal("Fullset: restored '" + pending.name + "'." + note).withStyle(GREEN), false);
+        pending = null;
     }
 
     private static int clearSingle(CommandContext<FabricClientCommandSource> ctx) {
@@ -304,14 +361,19 @@ public class FullsetMod implements ClientModInitializer {
 
     private static int clear(CommandContext<FabricClientCommandSource> ctx, String name) {
         FabricClientCommandSource source = ctx.getSource();
-        ensureLoaded(source.getClient().getConnection());
+        ClientPacketListener conn = source.getClient().getConnection();
+        ensureLoaded(conn);
         if (!STORE.containsKey(name)) {
             source.sendError(Component.literal("No loadout named '" + name + "'." + savedList()));
             return 0;
         }
         STORE.remove(name);
-        saveStore(source.getClient().getConnection());
-        source.sendFeedback(Component.literal("Removed loadout '" + name + "'.").withStyle(YELLOW));
+        if (saveStore(conn)) {
+            source.sendFeedback(Component.literal("Removed loadout '" + name + "'.").withStyle(YELLOW));
+        } else {
+            source.sendError(Component.literal(
+                    "Removed loadout '" + name + "' from memory, but writing loadouts.json failed. Check the log."));
+        }
         return 1;
     }
 
@@ -405,6 +467,8 @@ public class FullsetMod implements ClientModInitializer {
         final List<ItemStack> stacks;
         final GameType previous;
         int ticks = 0;
+        int applied = 0;
+        boolean creativeConfirmed = false;
 
         PendingRestore(String name, List<ItemStack> stacks, GameType previous) {
             this.name = name;
