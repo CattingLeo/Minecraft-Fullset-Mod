@@ -18,13 +18,17 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.network.chat.Style;
 import net.minecraft.network.chat.TextColor;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -67,6 +71,13 @@ public class FullsetMod implements ClientModInitializer {
     // How many enchantments the last restore had to drop (server didn't have them).
     private static int lastDropped = 0;
 
+    // Result banner the HUD shows for a few seconds after a restore finishes/fails/times
+    // out. The vanilla action bar is too easy to clobber with other chat/pickup messages,
+    // so this is a more reliable way to see the outcome.
+    private static Component resultMessage = null;
+    private static int resultTicksLeft = 0;
+    private static final int RESULT_DURATION_TICKS = 60; // ~3 seconds
+
     private static Path storeFile() {
         return FabricLoader.getInstance().getConfigDir().resolve(MOD_ID).resolve("loadouts.json");
     }
@@ -87,6 +98,49 @@ public class FullsetMod implements ClientModInitializer {
         });
         // Drives the multiplayer restore once the server confirms creative mode.
         ClientTickEvents.END_CLIENT_TICK.register(FullsetMod::tickPending);
+        HudElementRegistry.addLast(Identifier.fromNamespaceAndPath(MOD_ID, "restore_hud"), FullsetMod::renderHud);
+    }
+
+    // ---- HUD ----
+
+    private static void renderHud(GuiGraphicsExtractor guiGraphics, DeltaTracker deltaTracker) {
+        Minecraft client = Minecraft.getInstance();
+        int centerX = guiGraphics.guiWidth() / 2;
+
+        PendingRestore p = pending;
+        if (p != null) {
+            int barWidth = 160, barHeight = 6;
+            int barX = centerX - barWidth / 2;
+            int barY = 16;
+
+            Component label = p.creativeConfirmed
+                    ? Component.literal("Fullset: restoring '" + p.name + "'  " + p.applied + "/" + SIZE)
+                    : Component.literal("Fullset: waiting for creative mode...");
+
+            guiGraphics.fill(barX - 4, barY - 13, barX + barWidth + 4, barY + barHeight + 4, 0x90000000);
+            guiGraphics.centeredText(client.font, label, centerX, barY - 10, 0xFFFFFF);
+
+            guiGraphics.fill(barX, barY, barX + barWidth, barY + barHeight, 0x55FFFFFF);
+            if (p.creativeConfirmed) {
+                int filled = Math.round(barWidth * ((float) p.applied / SIZE));
+                if (filled > 0) {
+                    guiGraphics.fill(barX, barY, barX + filled, barY + barHeight, 0xFF55FF55);
+                }
+            }
+            guiGraphics.outline(barX - 1, barY - 1, barWidth + 2, barHeight + 2, 0xFFFFFFFF);
+            return;
+        }
+
+        if (resultTicksLeft > 0 && resultMessage != null) {
+            int alpha = resultTicksLeft < 15 ? Math.round(255 * (resultTicksLeft / 15f)) : 255;
+            guiGraphics.fill(centerX - 100, 3, centerX + 100, 17, (alpha / 2) << 24);
+            guiGraphics.centeredText(client.font, resultMessage, centerX, 8, (alpha << 24) | 0xFFFFFF);
+        }
+    }
+
+    private static void showResult(Component message) {
+        resultMessage = message;
+        resultTicksLeft = RESULT_DURATION_TICKS;
     }
 
     // ---- persistence (global, crash-proof) ----
@@ -278,14 +332,14 @@ public class FullsetMod implements ClientModInitializer {
         }
         GameType previous = client.gameMode.getPlayerMode();
         pending = new PendingRestore(name, copies, previous);
+        resultTicksLeft = 0; // let the progress bar take over from any leftover result banner
         conn.sendCommand("gamemode creative");
-        client.gui.hud.setOverlayMessage(
-                Component.literal("Fullset: restoring '" + name + "'...").withStyle(GREEN), false);
         return 1;
     }
 
     // Runs every client tick; finishes a multiplayer restore once creative mode is active.
     private static void tickPending(Minecraft client) {
+        if (resultTicksLeft > 0) resultTicksLeft--;
         if (pending == null) return;
         if (client.player == null || client.gameMode == null || client.getConnection() == null) {
             pending = null;
@@ -299,10 +353,9 @@ public class FullsetMod implements ClientModInitializer {
                     || client.player.getAbilities().instabuild;
             if (!creative) {
                 if (pending.ticks > 100) { // ~5 seconds and still not creative
-                    client.gui.hud.setOverlayMessage(
-                            Component.literal("Fullset: couldn't restore '" + pending.name
-                                    + "' - not detected as creative. Do you have permission to use /gamemode here?")
-                                    .withStyle(RED), false);
+                    showResult(Component.literal("Fullset: couldn't restore '" + pending.name
+                            + "' - not detected as creative. Do you have permission to use /gamemode here?")
+                            .withStyle(RED));
                     pending = null;
                 }
                 return; // keep waiting
@@ -324,9 +377,8 @@ public class FullsetMod implements ClientModInitializer {
             }
             pending.applied = end;
         } catch (Exception e) {
-            client.gui.hud.setOverlayMessage(
-                    Component.literal("Fullset: restore of '" + pending.name + "' FAILED: "
-                            + e.getClass().getSimpleName()).withStyle(RED), false);
+            showResult(Component.literal("Fullset: restore of '" + pending.name + "' FAILED: "
+                    + e.getClass().getSimpleName()).withStyle(RED));
             System.err.println("[fullset] restore error: " + e);
             pending = null;
             return;
@@ -340,8 +392,7 @@ public class FullsetMod implements ClientModInitializer {
         String note = (lastDropped > 0)
                 ? " (" + lastDropped + " enchantment(s) this server blocks were skipped)"
                 : "";
-        client.gui.hud.setOverlayMessage(
-                Component.literal("Fullset: restored '" + pending.name + "'." + note).withStyle(GREEN), false);
+        showResult(Component.literal("Fullset: restored '" + pending.name + "'." + note).withStyle(GREEN));
         pending = null;
     }
 
