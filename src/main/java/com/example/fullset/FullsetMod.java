@@ -299,23 +299,35 @@ public class FullsetMod implements ClientModInitializer {
         MinecraftServer integrated = client.getSingleplayerServer();
 
         if (integrated != null) {
-            // Single-player: set the inventory directly on our own server (full fidelity, no cheats).
+            // Single-player / LAN: set the inventory directly on our own server. Still has to
+            // go through safeForCreative - a saved item can carry a registry Holder (e.g. an
+            // enchantment) resolved against a *different* RegistryAccess instance than the one
+            // live now, which encodes fine locally but crashes the connection ("Can't find id
+            // for ... in map") the moment the server tries to broadcast it back to the client.
             LocalPlayer local = source.getPlayer();
             integrated.execute(() -> {
                 ServerPlayer sp = integrated.getPlayerList().getPlayer(local.getUUID());
                 if (sp == null) return;
+                RegistryAccess ra = integrated.registryAccess();
+                lastDropped = 0;
                 Inventory inv = sp.getInventory();
                 for (int i = 0; i < 36; i++) {
-                    inv.setItem(i, get(saved, i));
+                    inv.setItem(i, safeForCreative(get(saved, i), ra));
                 }
                 for (int a = 0; a < ARMOR.length; a++) {
-                    sp.setItemSlot(ARMOR[a], get(saved, 36 + a));
+                    sp.setItemSlot(ARMOR[a], safeForCreative(get(saved, 36 + a), ra));
                 }
-                sp.setItemSlot(EquipmentSlot.OFFHAND, get(saved, 40));
+                sp.setItemSlot(EquipmentSlot.OFFHAND, safeForCreative(get(saved, 40), ra));
                 sp.inventoryMenu.broadcastChanges();
                 sp.containerMenu.broadcastChanges();
+                int dropped = lastDropped;
+                client.execute(() -> {
+                    String note = dropped > 0
+                            ? " (" + dropped + " enchantment(s) couldn't be restored and were skipped)"
+                            : "";
+                    source.sendFeedback(Component.literal("Restored loadout '" + name + "'." + note).withStyle(GREEN));
+                });
             });
-            source.sendFeedback(Component.literal("Restored loadout '" + name + "'.").withStyle(GREEN));
             return 1;
         }
 
